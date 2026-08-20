@@ -2,12 +2,16 @@
 RAG Document Assistant - FastAPI backend.
 
 Endpoints:
-  POST /documents/upload  - upload a .pdf or .txt file; it is chunked, embedded,
-                             and stored in Postgres (with pgvector) for retrieval.
-  GET  /documents         - list uploaded documents.
-  POST /ask                - ask a question; the top-matching chunks are retrieved
-                             via cosine similarity and used to ground an answer.
-  GET  /health             - simple liveness check.
+  POST   /documents/upload    - upload a .pdf, .docx, .txt, or .md file; it is
+                                 chunked, embedded, and stored in Postgres (with
+                                 pgvector) for retrieval.
+  GET    /documents           - list uploaded documents.
+  DELETE /documents/{id}      - delete a document and all of its chunks.
+  POST   /ask                 - ask a question; the top-matching chunks are
+                                 retrieved via cosine similarity (with a
+                                 similarity score per source) and used to ground
+                                 an answer.
+  GET    /health               - simple liveness check.
 
 Embeddings are generated locally with sentence-transformers (no API key needed).
 Answer generation uses the OpenAI API if OPENAI_API_KEY is set; otherwise it falls
@@ -18,6 +22,7 @@ import io
 import os
 from typing import List, Optional
 
+from docx import Document as DocxReader
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,6 +84,7 @@ class SourceOut(BaseModel):
     document: str
     chunk_index: int
     excerpt: str
+    similarity: float
 
 
 class AskResponse(BaseModel):
@@ -99,11 +105,23 @@ def health():
 async def upload_document(file: UploadFile, db: Session = Depends(get_db)):
     raw = await file.read()
     filename = file.filename or "untitled"
+    filename_lower = filename.lower()
 
-    if filename.lower().endswith(".pdf"):
+    supported_extensions = (".pdf", ".docx", ".txt", ".md")
+    if not filename_lower.endswith(supported_extensions):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Supported: {', '.join(supported_extensions)}",
+        )
+
+    if filename_lower.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(raw))
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif filename_lower.endswith(".docx"):
+        docx_reader = DocxReader(io.BytesIO(raw))
+        text = "\n".join(paragraph.text for paragraph in docx_reader.paragraphs)
     else:
+        # .txt, .md, and other plain-text formats
         text = raw.decode("utf-8", errors="ignore")
 
     chunks = chunk_text(text)
@@ -139,15 +157,30 @@ def list_documents(db: Session = Depends(get_db)):
     ]
 
 
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: int, db: Session = Depends(get_db)):
+    """Delete a document and all of its chunks (chunks cascade-delete via the
+    relationship configured in models.py)."""
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.delete(document)
+    db.commit()
+    return {"status": "deleted", "id": document_id}
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask_question(payload: AskRequest, db: Session = Depends(get_db)):
     model = get_embedding_model()
     question_embedding = model.encode(payload.question, normalize_embeddings=True).tolist()
 
+    # cosine_distance ranges 0 (identical) to 2 (opposite); for normalized
+    # embeddings, similarity = 1 - distance gives a 0..1 "closeness" score.
+    distance = Chunk.embedding.cosine_distance(question_embedding)
     results = db.execute(
-        select(Chunk, Document)
+        select(Chunk, Document, distance.label("distance"))
         .join(Document, Chunk.document_id == Document.id)
-        .order_by(Chunk.embedding.cosine_distance(question_embedding))
+        .order_by(distance)
         .limit(payload.top_k)
     ).all()
 
@@ -155,8 +188,13 @@ def ask_question(payload: AskRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No documents have been uploaded yet")
 
     sources = [
-        SourceOut(document=doc.filename, chunk_index=chunk.chunk_index, excerpt=chunk.content)
-        for chunk, doc in results
+        SourceOut(
+            document=doc.filename,
+            chunk_index=chunk.chunk_index,
+            excerpt=chunk.content,
+            similarity=round(max(0.0, 1 - dist), 4),
+        )
+        for chunk, doc, dist in results
     ]
 
     answer, used_llm = _generate_answer(payload.question, [s.excerpt for s in sources])
